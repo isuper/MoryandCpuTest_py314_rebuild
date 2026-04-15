@@ -21,6 +21,21 @@ except ImportError:
     QT_API = "PySide6"
 warnings.filterwarnings("ignore")
 
+if os.name == "nt":
+    CREATE_NO_WINDOW = 134217728
+else:
+    CREATE_NO_WINDOW = 0
+
+
+def run_subprocess(command, **kwargs):
+    kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+    return subprocess.run(command, **kwargs)
+
+
+def popen_subprocess(command, **kwargs):
+    kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+    return subprocess.Popen(command, **kwargs)
+
 class MonitorApp(QtWidgets.QWidget):
     log_signal = Signal(str)
     cpu_plot_signal = Signal(str)
@@ -100,19 +115,17 @@ class MonitorApp(QtWidgets.QWidget):
         super().closeEvent(event)
 
     def disable_screen_lock(self):
-        subprocess.run(['adb', 'shell', 'svc', 'power', 'stayon', 'true'])
+        run_subprocess(['adb', 'shell', 'svc', 'power', 'stayon', 'true'])
 
     def pull_systrace_file(self, output_file, script_dir):
         cpuinfo_dir = os.path.join(script_dir, "cpuinfo")
         os.makedirs(cpuinfo_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_file = os.path.join(cpuinfo_dir, f"trace_output_{timestamp_str}")
-        pull_command = f"adb pull {output_file} {local_file}"
-        subprocess.run(pull_command, shell=True)
+        run_subprocess(["adb", "pull", output_file, local_file])
 
     def delete_systrace_file(self, output_file):
-        delete_command = f"adb shell rm {output_file}"
-        subprocess.run(delete_command, shell=True)
+        run_subprocess(["adb", "shell", "rm", output_file])
 
     def run_atrace(self, duration, script_dir):
         while self.monitoring:
@@ -122,14 +135,14 @@ class MonitorApp(QtWidgets.QWidget):
                 f"atrace -z -b 8192 video gfx input view wm rs hal "
                 f"sched freq idle irq -t {duration} > {output_file}"
             )
-            subprocess.run(["adb", "shell", atrace_command], stdout=(subprocess.PIPE), text=True, errors="ignore")
+            run_subprocess(["adb", "shell", atrace_command], stdout=(subprocess.PIPE), text=True, errors="ignore")
             self.pull_systrace_file(output_file, script_dir=script_dir)
             time.sleep(2)
             self.delete_systrace_file(output_file)
 
     def dump_android_heap(self, package_name):
         try:
-            pid_result = subprocess.run(['adb', 'shell', 'ps -ef | grep', package_name], stdout=(subprocess.PIPE), text=True,
+            pid_result = run_subprocess(['adb', 'shell', 'ps -ef | grep', package_name], stdout=(subprocess.PIPE), text=True,
               errors="ignore")
             if pid_result.returncode != 0:
                 self.log_signal.emit("无法获取应用的 PID，请确保应用正在运行。")
@@ -146,8 +159,7 @@ class MonitorApp(QtWidgets.QWidget):
                     self.log_signal.emit("未能找到有效的 PID。")
                     return
 
-                dump_command = f"adb shell am dumpheap {pid} /data/local/tmp/heapdump.hprof"
-                subprocess.run(dump_command, shell=True)
+                run_subprocess(["adb", "shell", "am", "dumpheap", pid, "/data/local/tmp/heapdump.hprof"])
                 if getattr(sys, "frozen", False):
                     current_dir = os.path.dirname(os.path.abspath(sys.executable))
                 else:
@@ -156,8 +168,7 @@ class MonitorApp(QtWidgets.QWidget):
             os.makedirs(raminfo_dir, exist_ok=True)
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = os.path.join(raminfo_dir, f"heapdump_{current_time}.hprof")
-            pull_command = f"adb pull /data/local/tmp/heapdump.hprof {output_file}"
-            subprocess.run(pull_command, shell=True)
+            run_subprocess(["adb", "pull", "/data/local/tmp/heapdump.hprof", output_file])
             self.log_signal.emit(f"Heap Dump 已成功生成并保存到 {output_file}")
         except Exception as e:
             try:
@@ -264,7 +275,7 @@ class MonitorApp(QtWidgets.QWidget):
             self.monitoring_finished_signal.emit()
 
     def get_process_memory_info(self, package_name):
-        result = subprocess.run(['adb', 'shell', 'dumpsys', 'meminfo', package_name], stdout=(subprocess.PIPE))
+        result = run_subprocess(['adb', 'shell', 'dumpsys', 'meminfo', package_name], stdout=(subprocess.PIPE))
         output = result.stdout.decode("utf-8")
         memory_info = {}
         for line in output.split("\n"):
@@ -304,7 +315,7 @@ class MonitorApp(QtWidgets.QWidget):
                 del e
 
     def get_cpu_cores(self):
-        result = subprocess.run(['adb', 'shell', 'grep -c ^processor /proc/cpuinfo'], stdout=(subprocess.PIPE),
+        result = run_subprocess(['adb', 'shell', 'grep -c ^processor /proc/cpuinfo'], stdout=(subprocess.PIPE),
           stderr=(subprocess.PIPE),
           text=True)
         if result.returncode == 0:
@@ -313,7 +324,7 @@ class MonitorApp(QtWidgets.QWidget):
         return 1
 
     def get_pid(self, pkg_name):
-        result = subprocess.run(["adb", "shell", "pidof", pkg_name], stdout=(subprocess.PIPE),
+        result = run_subprocess(["adb", "shell", "pidof", pkg_name], stdout=(subprocess.PIPE),
           stderr=(subprocess.PIPE),
           text=True)
         if result.returncode == 0 and result.stdout.strip():
@@ -331,10 +342,8 @@ class MonitorApp(QtWidgets.QWidget):
         cstime  所有已死在核心态运行的时间，单位为jiffies
         """
         utime = stime = cutime = cstime = 0
-        cmd = "adb shell cat /proc/" + pid + "/stat"
-        p = subprocess.Popen(cmd, stdout=(subprocess.PIPE), stderr=(subprocess.PIPE),
-          stdin=(subprocess.PIPE),
-          shell=True)
+        p = popen_subprocess(["adb", "shell", "cat", f"/proc/{pid}/stat"], stdout=(subprocess.PIPE), stderr=(subprocess.PIPE),
+          stdin=(subprocess.PIPE))
         output, err = p.communicate()
         res = output.split()
         if len(res) < 17:
@@ -348,10 +357,8 @@ class MonitorApp(QtWidgets.QWidget):
 
     def totalCpuTime(self):
         user = nice = system = idle = iowait = irq = softirq = 0
-        cmd = "adb shell cat /proc/stat"
-        p = subprocess.Popen(cmd, stdout=(subprocess.PIPE), stderr=(subprocess.PIPE),
-          stdin=(subprocess.PIPE),
-          shell=True)
+        p = popen_subprocess(["adb", "shell", "cat", "/proc/stat"], stdout=(subprocess.PIPE), stderr=(subprocess.PIPE),
+          stdin=(subprocess.PIPE))
         output, err = p.communicate()
         res = output.split()
         if len(res) < 8:
