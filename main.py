@@ -4,6 +4,7 @@
 # [Clang 16.0.0 (clang-1600.0.26.6)]
 # Embedded file name: MoryandCpuTset.py
 import sys, subprocess, threading, warnings
+import shutil
 import matplotlib.pyplot as plt
 from datetime import datetime
 import time, os, re
@@ -11,16 +12,24 @@ QT_API = None
 try:
     from PyQt5 import QtWidgets, QtCore
     from PyQt5.QtGui import QPixmap
+    from PyQt5.QtCore import pyqtSignal as Signal
     QT_API = "PyQt5"
 except ImportError:
     from PySide6 import QtWidgets, QtCore
     from PySide6.QtGui import QPixmap
+    from PySide6.QtCore import Signal
     QT_API = "PySide6"
 warnings.filterwarnings("ignore")
 
 class MonitorApp(QtWidgets.QWidget):
+    log_signal = Signal(str)
+    cpu_plot_signal = Signal(str)
+    memory_plot_signal = Signal(str)
+    monitoring_finished_signal = Signal()
 
     def __init__(self):
+        self.monitoring = False
+        self.trace_thread = None
         super().__init__()
         self.initUI()
 
@@ -40,13 +49,13 @@ class MonitorApp(QtWidgets.QWidget):
         self.duration_input = QtWidgets.QComboBox(self)
         self.duration_input.addItems([str(i) for i in range(1, 25)])
         self.duration_input.setCurrentText("1")
-        self.start_button = QPushButton("开始监测", self)
+        self.start_button = QtWidgets.QPushButton("开始监测", self)
         self.start_button.clicked.connect(self.start_monitoring)
         self.output_area = QtWidgets.QTextEdit(self)
         self.output_area.setReadOnly(True)
-        self.chart_label = QLabel(self)
+        self.chart_label = QtWidgets.QLabel(self)
         self.chart_label.setFixedSize(800, 400)
-        self.chart_label2 = QLabel(self)
+        self.chart_label2 = QtWidgets.QLabel(self)
         self.chart_label2.setFixedSize(800, 400)
         chart_layout = QtWidgets.QHBoxLayout()
         chart_layout.addWidget(self.chart_label)
@@ -63,16 +72,32 @@ class MonitorApp(QtWidgets.QWidget):
         layout.addWidget(self.output_area)
         layout.addLayout(chart_layout)
         self.setLayout(layout)
+        self.log_signal.connect(self.output_area.append)
+        self.cpu_plot_signal.connect(self.display_plot_cpu)
+        self.memory_plot_signal.connect(self.display_plot_ram)
+        self.monitoring_finished_signal.connect(lambda: self.start_button.setEnabled(True))
 
     def start_monitoring(self):
+        if self.monitoring:
+            self.log_signal.emit("监控已在运行中。")
+            return
+        if shutil.which("adb") is None:
+            self.log_signal.emit("未检测到 adb，请先安装 Android platform-tools 并加入 PATH。")
+            return
         package_name = self.package_name_input.currentText()
         cpu_threshold = float(self.cpu_threshold_input.currentText())
         memory_threshold = float(self.memory_threshold_input.currentText())
         duration_hours = float(self.duration_input.currentText())
-        self.output_area.append(f"开始监控应用: {package_name}")
+        self.monitoring = True
+        self.start_button.setEnabled(False)
+        self.log_signal.emit(f"开始监控应用: {package_name}")
         self.monitor_thread = threading.Thread(target=(self.monitor_app), args=(
-         package_name, cpu_threshold, memory_threshold, duration_hours))
+         package_name, cpu_threshold, memory_threshold, duration_hours), daemon=True)
         self.monitor_thread.start()
+
+    def closeEvent(self, event):
+        self.monitoring = False
+        super().closeEvent(event)
 
     def disable_screen_lock(self):
         subprocess.run(['adb', 'shell', 'svc', 'power', 'stayon', 'true'])
@@ -90,24 +115,24 @@ class MonitorApp(QtWidgets.QWidget):
         subprocess.run(delete_command, shell=True)
 
     def run_atrace(self, duration, script_dir):
-        while True:
+        while self.monitoring:
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"/sdcard/trace_output_{timestamp_str}"
-            pid_result = subprocess.run([
-             "adb", "shell", "atrace", "-z", "-b", "8192", "video", "gfx", "input", "view", "wm", "rs", "hal",
-             "sched",
-             "freq", "idle", "irq", "-t", str(duration), ">", output_file],
-              stdout=(subprocess.PIPE), text=True, errors="ignore")
+            atrace_command = (
+                f"atrace -z -b 8192 video gfx input view wm rs hal "
+                f"sched freq idle irq -t {duration} > {output_file}"
+            )
+            subprocess.run(["adb", "shell", atrace_command], stdout=(subprocess.PIPE), text=True, errors="ignore")
             self.pull_systrace_file(output_file, script_dir=script_dir)
             time.sleep(2)
             self.delete_systrace_file(output_file)
 
     def dump_android_heap(self, package_name):
         try:
-            pid_result = subprocess.run(['adb', 'shell', 'ps', '-ef|grep', package_name], stdout=(subprocess.PIPE), text=True,
+            pid_result = subprocess.run(['adb', 'shell', 'ps -ef | grep', package_name], stdout=(subprocess.PIPE), text=True,
               errors="ignore")
             if pid_result.returncode != 0:
-                self.output_area.append("无法获取应用的 PID，请确保应用正在运行。")
+                self.log_signal.emit("无法获取应用的 PID，请确保应用正在运行。")
                 return
             else:
                 for line in pid_result.stdout.strip().splitlines():
@@ -115,10 +140,10 @@ class MonitorApp(QtWidgets.QWidget):
                         pid_match = re.search("\\b(\\d+)\\b", line)
                         if pid_match:
                             pid = pid_match.group(1)
-                            self.output_area.append(f"找到的 PID: {pid}")
+                            self.log_signal.emit(f"找到的 PID: {pid}")
                             break
                 else:
-                    self.output_area.append("未能找到有效的 PID。")
+                    self.log_signal.emit("未能找到有效的 PID。")
                     return
 
                 dump_command = f"adb shell am dumpheap {pid} /data/local/tmp/heapdump.hprof"
@@ -133,12 +158,10 @@ class MonitorApp(QtWidgets.QWidget):
             output_file = os.path.join(raminfo_dir, f"heapdump_{current_time}.hprof")
             pull_command = f"adb pull /data/local/tmp/heapdump.hprof {output_file}"
             subprocess.run(pull_command, shell=True)
-            pull_command = f"adb pull /data/local/tmp/heapdump.hprof {output_file}"
-            subprocess.run(pull_command, shell=True)
-            self.output_area.append(f"Heap Dump 已成功生成并保存到 {output_file}")
+            self.log_signal.emit(f"Heap Dump 已成功生成并保存到 {output_file}")
         except Exception as e:
             try:
-                self.output_area.append(f"发生错误: {e}")
+                self.log_signal.emit(f"发生错误: {e}")
             finally:
                 e = None
                 del e
@@ -159,7 +182,7 @@ class MonitorApp(QtWidgets.QWidget):
         plt.figtext(0.15, 0.01, f"Average Memory Usage: {avg_memory:.2f} MB", fontsize=10, ha="left")
         plt.savefig(file_path)
         plt.close()
-        self.display_plot_ram(file_path)
+        self.memory_plot_signal.emit(file_path)
 
     def save_cpu_plot(self, time_stamps, cpu_usage, high_cpu_times, avg_cpu, file_path):
         plt.figure(figsize=(10, 5))
@@ -177,7 +200,7 @@ class MonitorApp(QtWidgets.QWidget):
         plt.figtext(0.15, 0.01, f"Average CPU Usage: {avg_cpu:.2f} %", fontsize=10, ha="left")
         plt.savefig(file_path)
         plt.close()
-        self.display_plot_cpu(file_path)
+        self.cpu_plot_signal.emit(file_path)
 
     def display_plot_cpu(self, file_path):
         pixmap = QPixmap(file_path)
@@ -188,53 +211,57 @@ class MonitorApp(QtWidgets.QWidget):
         self.chart_label2.setPixmap(pixmap.scaled(self.chart_label2.size(), QtCore.Qt.KeepAspectRatio))
 
     def monitor_app(self, package_name, cpu_threshold, memory_threshold, duration_hours):
-        time_stamps = []
-        total_pss_usage = []
-        cpu_usage = []
-        drop_times = []
-        high_cpu_times = []
-        start_time = time.time()
-        self.disable_screen_lock()
-        if getattr(sys, "frozen", False):
-            script_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        memory_plot_file_path = os.path.join(script_dir, f"memory_usage_over_time_{timestamp_str}.png")
-        cpu_plot_file_path = os.path.join(script_dir, f"cpu_usage_over_time_{timestamp_str}.png")
-        end_time = start_time + duration_hours * 60 * 60
-        previous_pss_mb = None
-        trace_thread = threading.Thread(target=(self.run_atrace), args=(10, script_dir))
-        trace_thread.start()
-        while time.time() < end_time:
-            current_time = datetime.now()
-            total_pss_kb = self.get_process_memory_info(package_name)
-            total_pss_mb = total_pss_kb / 1024
-            cpu_percent = self.get_process_cpu_info(package_name)
-            if previous_pss_mb is not None:
-                if previous_pss_mb - total_pss_mb > memory_threshold:
-                    self.dump_android_heap(package_name)
-                    drop_times.append(current_time)
-            previous_pss_mb = total_pss_mb
-            if cpu_percent > cpu_threshold:
-                high_cpu_times.append(current_time)
-            time_stamps.append(current_time)
-            total_pss_usage.append(total_pss_mb)
-            cpu_usage.append(cpu_percent)
-            if len(time_stamps) % 360 == 0:
-                avg_memory = sum(total_pss_usage[-360:]) / 360
-                avg_cpu = sum(cpu_usage[-360:]) / 360
-                self.output_area.append(f"Average Memory Usage (last hour): {avg_memory:.2f} MB")
-                self.output_area.append(f"Average CPU Usage (last hour): {avg_cpu:.2f} %")
-            avg_memory = sum(total_pss_usage) / len(total_pss_usage) if total_pss_usage else 0
-            avg_cpu = sum(cpu_usage) / len(cpu_usage) if cpu_usage else 0
-            self.save_memory_plot(time_stamps, total_pss_usage, drop_times, avg_memory, memory_plot_file_path, package_name)
-            self.save_cpu_plot(time_stamps, cpu_usage, high_cpu_times, avg_cpu, cpu_plot_file_path)
-            execution_time = datetime.now().strftime("%H:%M:%S")
-            elapsed_time = time.time() - start_time
-            elapsed_hours = round(elapsed_time / 3600, 2)
-            self.output_area.append(f"\x1b[92mExecution time: {execution_time}, Elapsed time: {elapsed_hours:.2f} hours\x1b[0m")
-            time.sleep(10)
+        try:
+            time_stamps = []
+            total_pss_usage = []
+            cpu_usage = []
+            drop_times = []
+            high_cpu_times = []
+            start_time = time.time()
+            self.disable_screen_lock()
+            if getattr(sys, "frozen", False):
+                script_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            memory_plot_file_path = os.path.join(script_dir, f"memory_usage_over_time_{timestamp_str}.png")
+            cpu_plot_file_path = os.path.join(script_dir, f"cpu_usage_over_time_{timestamp_str}.png")
+            end_time = start_time + duration_hours * 60 * 60
+            previous_pss_mb = None
+            self.trace_thread = threading.Thread(target=(self.run_atrace), args=(10, script_dir), daemon=True)
+            self.trace_thread.start()
+            while self.monitoring and time.time() < end_time:
+                current_time = datetime.now()
+                total_pss_kb = self.get_process_memory_info(package_name)
+                total_pss_mb = total_pss_kb / 1024
+                cpu_percent = self.get_process_cpu_info(package_name)
+                if previous_pss_mb is not None:
+                    if previous_pss_mb - total_pss_mb > memory_threshold:
+                        self.dump_android_heap(package_name)
+                        drop_times.append(current_time)
+                previous_pss_mb = total_pss_mb
+                if cpu_percent > cpu_threshold:
+                    high_cpu_times.append(current_time)
+                time_stamps.append(current_time)
+                total_pss_usage.append(total_pss_mb)
+                cpu_usage.append(cpu_percent)
+                if len(time_stamps) % 360 == 0:
+                    avg_memory = sum(total_pss_usage[-360:]) / 360
+                    avg_cpu = sum(cpu_usage[-360:]) / 360
+                    self.log_signal.emit(f"Average Memory Usage (last hour): {avg_memory:.2f} MB")
+                    self.log_signal.emit(f"Average CPU Usage (last hour): {avg_cpu:.2f} %")
+                avg_memory = sum(total_pss_usage) / len(total_pss_usage) if total_pss_usage else 0
+                avg_cpu = sum(cpu_usage) / len(cpu_usage) if cpu_usage else 0
+                self.save_memory_plot(time_stamps, total_pss_usage, drop_times, avg_memory, memory_plot_file_path, package_name)
+                self.save_cpu_plot(time_stamps, cpu_usage, high_cpu_times, avg_cpu, cpu_plot_file_path)
+                execution_time = datetime.now().strftime("%H:%M:%S")
+                elapsed_time = time.time() - start_time
+                elapsed_hours = round(elapsed_time / 3600, 2)
+                self.log_signal.emit(f"Execution time: {execution_time}, Elapsed time: {elapsed_hours:.2f} hours")
+                time.sleep(10)
+        finally:
+            self.monitoring = False
+            self.monitoring_finished_signal.emit()
 
     def get_process_memory_info(self, package_name):
         result = subprocess.run(['adb', 'shell', 'dumpsys', 'meminfo', package_name], stdout=(subprocess.PIPE))
@@ -270,27 +297,26 @@ class MonitorApp(QtWidgets.QWidget):
             return cpu
         except Exception as e:
             try:
-                self.output_area.append(f"发生错误: {e}")
+                self.log_signal.emit(f"发生错误: {e}")
                 return 0
             finally:
                 e = None
                 del e
 
     def get_cpu_cores(self):
-        result = subprocess.run(['adb', 'shell', 'cat', '/proc/cpuinfo', '|', 'grep', '"processor"', 
-         '|', 'wc', '-l'], stdout=(subprocess.PIPE),
+        result = subprocess.run(['adb', 'shell', 'grep -c ^processor /proc/cpuinfo'], stdout=(subprocess.PIPE),
           stderr=(subprocess.PIPE),
           text=True)
         if result.returncode == 0:
             return int(result.stdout.strip())
-        self.output_area.append(f"Error getting CPU cores:{result.stderr}")
+        self.log_signal.emit(f"Error getting CPU cores:{result.stderr}")
         return 1
 
     def get_pid(self, pkg_name):
         result = subprocess.run(["adb", "shell", "pidof", pkg_name], stdout=(subprocess.PIPE),
           stderr=(subprocess.PIPE),
           text=True)
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout.strip():
             return int(result.stdout.strip())
         print("Error getting PID for package:", pkg_name, result.stderr)
         return
@@ -311,6 +337,8 @@ class MonitorApp(QtWidgets.QWidget):
           shell=True)
         output, err = p.communicate()
         res = output.split()
+        if len(res) < 17:
+            return 0
         utime = res[13].decode()
         stime = res[14].decode()
         cutime = res[15].decode()
@@ -326,6 +354,8 @@ class MonitorApp(QtWidgets.QWidget):
           shell=True)
         output, err = p.communicate()
         res = output.split()
+        if len(res) < 8:
+            return 0
         for info in res:
             if info.decode() == "cpu":
                 user = res[1].decode()
